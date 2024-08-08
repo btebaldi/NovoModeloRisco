@@ -6,6 +6,11 @@ library(xts)
 library(rugarch)
 library(evd)
 
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+rm(list=ls())
 
 # User defined function ---------------------------------------------------
 
@@ -13,11 +18,11 @@ d.ln <- function(x){
   return(log(x) - dplyr::lag(log(x)))
 }
 
-determine_KO <- function(simulated_data){
+determine_KO <- function(cen_hist){
   KO <- rep(NA, 10)
   names(KO) <- sprintf("KO_%d", 1:10)
-  for(i in seq_along(KO)){
-    KO[i] <- quantile(abs(simulated_data[i, ]), probs = c(0.995) )
+  for(i in 1:10){
+    KO[i] <- quantile(abs(cen_hist[i,1, ]), probs = c(0.9999) )
   }
   return(KO)
 }
@@ -50,18 +55,41 @@ tbl[, c("dl.Ibov", "dl.Dol") := log(.SD) - shift(log(.SD), 1, NA, "lag"), .SDcol
 tbl <- tbl[ -1, .(Date, dl.Ibov, dl.Dol)]
 
 
+
+# Construindo cenarios Historicos -----------------------------------------
+
+
+cen_hist <- array(NA,
+                  dim = c(10, 2, nrow(tbl)-10),
+                  dimnames = list(sprintf("HP%02d", 1:10),
+                                  c("Ibov", "Dol"),
+                                  sprintf("Cen_%d", 1:(nrow(tbl)-10))));  
+
+for(i in seq_len(nrow(tbl)-10)){
+  cen_hist[ , , i] <- tbl[i:(i+9),c("dl.Ibov", "dl.Dol")] %>% data.matrix() %>% apply(2, cumsum)
+  
+  # names(M) <- sprintf("CEN_%d", i)
+  # colnames(M[[1]]) <- paste("HP", 1:10, sep="")
+  # cen_hist <- append(cen_hist, M)
+}
+
+
 # ACF e PACF --------------------------------------------------------------
 
+png(file=sprintf("./figs/%s_ACF_raw.png", "dl.Ibov"), width=6, height=4, units="in", res=100)
 TSA::acf(tbl[ , dl.Ibov])
-TSA::acf(tbl[ , dl.Dol])
+TSA::acf(tbl[ , dl.Ibov^2])
+dev.off()
 
+png(file=sprintf("./figs/%s_PACF_raw.png", "dl.Ibov"), width=6, height=4, units="in", res=100)
 pacf(tbl[ , dl.Ibov])
-pacf(tbl[ , dl.Dol])
+dev.off()
+
 
 # Modelando o Garch -------------------------------------------------------
 
 spec <- ugarchspec( variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
-                    mean.model = list(armaOrder = c(10,0), include.mean = FALSE),
+                    mean.model = list(armaOrder = c(1,0), include.mean = FALSE),
                     distribution.model = "sstd" # Skewed Standardized Student's t-distribution
 )
 
@@ -74,48 +102,85 @@ names(z) <- col
 # Fit the GARCH model
 fit <- ugarchfit(spec = spec, data = z)
 
+residuals <- residuals(fit)/sigma(fit)
+
 # Analise de residuo
-TSA::acf(as.numeric(residuals(fit)))
-pacf(as.numeric(residuals(fit)))
+png(file=sprintf("./figs/%s_ACF_garch.png", col), width=6, height=4, units="in", res=100)
+TSA::acf(residuals)
+TSA::acf(residuals^2)
+dev.off()
 
-# z <- xts(x = sp500ret, order.by = as.Date(rownames(sp500ret)))
-# garchspec <- ugarchspec(mean.model = list(armaOrder = c(1,0)),
-#                         variance.model = list(model ="gjrGARCH"),
-#                         distribution.model = "std")
-# 
-# garchroll <- ugarchroll(garchspec, data = z, n.start = 2500,
-#                         refit.window = "moving", refit.every = 100)
+png(file=sprintf("./figs/%s_PACF_garch.png", col), width=6, height=4, units="in", res=100)
+pacf(residuals)
+dev.off()
 
-
-# Extract standardized residuals
-residuals <- residuals(fit, standardize = TRUE)
 
 # Modelando o EVT ---------------------------------------------------------
-
-# Fit a generalized extreme value (GEV) distribution to the residuals
-gev_fit <- evd::fgev(residuals)
-
-# Print the fitted parameters
-print(gev_fit)
+hist(residuals, breaks = "FD")
 
 
-# Generate random samples from the fitted GEV distribution
+# Install and load necessary packages
+# install.packages("skewt")
+library(sn)
+
+
+# Define the log-likelihood function
+log_likelihood <- function(params, data) {
+  xi <- params[1]
+  omega <- params[2]
+  alpha <- params[3]
+  nu <- params[4]
+  
+  -sum(sn::dst(data,
+               xi = xi,
+               omega = omega,
+               alpha = alpha, 
+               nu = nu,
+               log = TRUE))
+}
+
+# Initial parameter guesses
+initial_params <- c(xi = 0, omega = 1, alpha = 1, nu = 10)
+
+# Perform MLE
+mle_fit <- optim(initial_params, log_likelihood, data = as.numeric(residuals),
+                 method = "L-BFGS-B",
+                 lower = c(-Inf, 0.001, -Inf, 0.001), upper = c(Inf, Inf, Inf, Inf))
+
+# Print the MLE estimates
+mle_params <- mle_fit$par
+# names(mle_params) <- c("location", "scale", "shape", "df")
+names(mle_params) <- c("xi", "omega", "alpha", "nu")
+print(mle_params)
+
+# data <- rst(n, location, scale, shape, df)
+
+xx <- sort(as.numeric(residuals))
+hist(as.numeric(residuals), breaks = "FD", freq = FALSE)
+lines(xx,
+      dst(xx,
+          xi = mle_params["xi"],
+          omega = mle_params["omega"],
+          alpha = mle_params["alpha"], 
+          nu = mle_params["nu"]), col = "red", lwd = 2)
+
 
 # Number of samples to generate
-n <- 1e6
+n <- 1e4
 
-sim_residuals <- evd::rgev(n, 
-                           loc = gev_fit$estimate["loc"],
-                           scale = gev_fit$estimate["scale"],
-                           shape = gev_fit$estimate["shape"])
+sim_residuals <- rst(n,
+                     xi = mle_params["xi"],
+                     omega = mle_params["omega"],
+                     alpha = mle_params["alpha"], 
+                     nu = mle_params["nu"])
 
-hist(sim_residuals, breaks = "FD")
+
 
 # Use the simulated residuals to generate new time series data Specify the same
 # GARCH model used before
 spec_sim <- ugarchspec(
   variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
-  mean.model = list(armaOrder = c(10, 0), include.mean = FALSE),
+  mean.model = list(armaOrder = c(1, 0), include.mean = FALSE),
   distribution.model = "sstd", # Skewed Standardized Student's t-distribution
   fixed.pars=as.list(coef(fit)) )
 
@@ -124,126 +189,171 @@ spec_sim <- ugarchspec(
 simulated_garch <- ugarchpath(spec_sim,
                               n.sim = 10,    # The simulation horizon.
                               n.start = 250,  # The burn-in sample.
-                              m.sim = 100000,      # The number of simulations.
+                              m.sim = 1e4,      # The number of simulations.
                               # presigma = fit@fit$sigma,
                               # prereturns = fit@fit$residuals,
-                              preresiduals = sim_residuals,
-                              fixed.pars=as.list(coef(fit)))
+                              preresiduals = sim_residuals)
 
 simulated_data <- fitted(simulated_garch)
 colnames(simulated_data) <- sprintf("CEN_%d", 1:ncol(simulated_data))
 
 simulated_data <- apply(simulated_data, MARGIN = 2, cumsum)
 
+png(file=sprintf("./figs/%s_hist_garch_sim.png", col), width=6, height=4, units="in", res=100)
 hist(simulated_data[2, ], breaks = "FD")
+dev.off()
 
-KO_vector <- determine_KO(simulated_data)
+q_val <- c(0.0004, 0.0050, 0.0100, 0.9900, 0.9950, 0.9996)
+dim(simulated_data)
+quantile(simulated_data[2, ], probs = q_val)
+
+quantile(cen_hist[2,1, ], probs = q_val)
+
+quantile(tbl$dl.Ibov, probs = q_val)
+
+
+KO_vector <- determine_KO(cen_hist)
 
 dim(simulated_data)
-simulated_data <- apply_KO(simulated_data, KO = KO_vector)
+# simulated_data <- apply_KO(simulated_data, KO = KO_vector)
 dim(simulated_data)
+
+
+png(file=sprintf("./figs/%s_hist_garch_sim with KO.png", col), width=6, height=4, units="in", res=100)
 hist(simulated_data[2, ], breaks = "FD")
+dev.off()
+
+q_val <- c(0.0004, 0.0050, 0.0100, 0.9900, 0.9950, 0.9996)
+dim(simulated_data)
+quantile(exp(simulated_data[2, ])-1, probs = q_val)
+quantile(exp(cen_hist[2,1, ])-1, probs = q_val)
+
+quantile(tbl$dl.Ibov, probs = q_val)
+quantile(cen_hist[1,1, ], probs = q_val)
+
+
+
+
+
+
+
 
 # Using Conditional information for garch --------------------------------
 
 # Fit the GARCH model
-fit.cond <- ugarchfit(spec = spec, data = z["2021/"])
+fit.cond <- ugarchfit(spec = spec, data = z["2022/"])
 
 # Analise de residuo
+
+png(file=sprintf("./figs/%s_ACF_Garch_cond.png", col), width=6, height=4, units="in", res=100)
 TSA::acf(as.numeric(residuals(fit.cond)))
+TSA::acf(as.numeric(residuals(fit.cond))^2)
+
+dev.off()
+
+png(file=sprintf("./figs/%s_PACF_Garch_cond.png", col), width=6, height=4, units="in", res=100)
 pacf(as.numeric(residuals(fit.cond)))
+dev.off()
+
 
 # Extract standardized residuals
-residuals.cond <- residuals(fit.cond, standardize = TRUE)
+residuals <- residuals(fit.cond)/sigma(fit.cond)
+TSA::acf(residuals)
+TSA::acf(residuals^2)
 
 # Modelando o EVT (conditional) -------------------------------------------
 
-# Fit a generalized extreme value (GEV) distribution to the residuals
-gev_fit.cond <- evd::fgev(residuals.cond)
+hist(residuals, breaks = "FD")
 
-# Print the fitted parameters
-print(gev_fit.cond)
 
-# Generate random samples from the fitted GEV distribution
+# Initial parameter guesses
+initial_params <- c(xi = 0, omega = 1, alpha = 1, nu = 10)
+
+# Perform MLE
+mle_fit <- optim(initial_params, log_likelihood, data = as.numeric(residuals),
+                 method = "L-BFGS-B",
+                 lower = c(-Inf, 0.001, -Inf, 0.001), upper = c(Inf, Inf, Inf, Inf))
+
+# Print the MLE estimates
+mle_params <- mle_fit$par
+# names(mle_params) <- c("location", "scale", "shape", "df")
+names(mle_params) <- c("xi", "omega", "alpha", "nu")
+print(mle_params)
+
+# data <- rst(n, location, scale, shape, df)
+
+xx <- sort(as.numeric(residuals))
+hist(as.numeric(residuals), breaks = "FD", freq = FALSE)
+lines(xx,
+      dst(xx,
+          xi = mle_params["xi"],
+          omega = mle_params["omega"],
+          alpha = mle_params["alpha"], 
+          nu = mle_params["nu"]), col = "red", lwd = 2)
+
 
 # Number of samples to generate
-n <- 1e6
+n <- 1e4
 
-sim_residuals.cond <- evd::rgev(n, 
-                           loc = gev_fit.cond$estimate["loc"],
-                           scale = gev_fit.cond$estimate["scale"],
-                           shape = gev_fit.cond$estimate["shape"])
+sim_residuals <- rst(n,
+                     xi = mle_params["xi"],
+                     omega = mle_params["omega"],
+                     alpha = mle_params["alpha"], 
+                     nu = mle_params["nu"])
 
-hist(sim_residuals.cond, breaks = "FD")
+
 
 # Use the simulated residuals to generate new time series data Specify the same
 # GARCH model used before
-spec_sim.cond <- ugarchspec(
+spec_sim <- ugarchspec(
   variance.model = list(model = "sGARCH", garchOrder = c(1, 1)),
-  mean.model = list(armaOrder = c(10, 0), include.mean = FALSE),
+  mean.model = list(armaOrder = c(1, 0), include.mean = FALSE),
   distribution.model = "sstd", # Skewed Standardized Student's t-distribution
   fixed.pars=as.list(coef(fit.cond)) )
 
 # Create an empty matrix to store the simulated data
-simulated_garch.cond <- ugarchpath(spec_sim.cond,
-                              n.sim = 10,    # The simulation horizon.
-                              n.start = 250,  # The burn-in sample.
-                              m.sim = 100000,      # The number of simulations.
-                              # presigma = fit@fit$sigma,
-                              # prereturns = fit@fit$residuals,
-                              preresiduals = sim_residuals,
-                              fixed.pars=as.list(coef(fit.cond)))
 
-simulated_data.cond <- fitted(simulated_garch.cond)
-colnames(simulated_data.cond) <- sprintf("CEN_%d", 1:ncol(simulated_data.cond))
+simulated_garch2 <- ugarchpath(spec_sim,
+                               n.sim = 10,    # The simulation horizon.
+                               n.start = 250,  # The burn-in sample.
+                               m.sim = 1e4,      # The number of simulations.
+                               # presigma = fit@fit$sigma,
+                               # prereturns = fit@fit$residuals,
+                               preresiduals = as.numeric(sim_residuals) )
 
-simulated_data.cond <- apply(simulated_data.cond, MARGIN = 2, cumsum)
-
-hist(simulated_data.cond[2, ], breaks = "FD")
-
-dim(simulated_data.cond)
-KO_vector <- determine_KO(simulated_data.cond)
-simulated_data.cond <- apply_KO(simulated_data.cond, KO = KO_vector)
-dim(simulated_data.cond)
-
-hist(simulated_data.cond[2, ], breaks = "FD")
+simulated_data2 <- fitted(simulated_garch2)
+colnames(simulated_data2) <- sprintf("CEN_%d", 1:ncol(simulated_data2))
 
 
-# Graficos ----------------------------------------------------------------
+q_val <- c(0.0004, 0.0050, 0.0100, 0.9900, 0.9950, 0.9996)
+dim(simulated_data2)
+quantile(simulated_data2[2, ], probs = q_val)
+quantile(simulated_data[2, ], probs = q_val)
+
+quantile(cen_hist[1,1, ], probs = q_val)
+quantile(tbl$dl.Ibov, probs = q_val)
+
+simulated_data11 <- apply_KO(simulated_data, KO = KO_vector)
+simulated_data21 <- apply_KO(simulated_data2, KO = KO_vector)
+dim(simulated_data11)
+dim(simulated_data21)
 
 
 
-simulated_data.cond %>% 
-  as_tibble() %>% 
-  mutate(HP = 1:10) %>% 
-  pivot_longer(cols = -HP) %>% 
-  ggplot() + 
-  geom_line(aes(x = HP, y = value, colour = name)) +
-  theme_bw() +
-  theme(legend.position = "none") + 
-  labs()
+quantile(simulated_data[2, ], probs = q_val)
+quantile(simulated_data2[2, ], probs = q_val)
+quantile(cen_hist[2,1, ], probs = q_val)
 
 
-simulated_data %>% 
-  as_tibble() %>% 
-  mutate(HP = 1:10) %>% 
-  pivot_longer(cols = -HP) %>% 
-  ggplot() + 
-  geom_line(aes(x = HP, y = value, colour = name)) +
-  theme_bw() +
-  theme(legend.position = "none") + 
-  labs()
+quantile(simulated_data11[2, ], probs = q_val)
+quantile(simulated_data21[2, ], probs = q_val)
+quantile(cen_hist[2,1, ], probs = q_val)
+
+quantile(c(simulated_data11[2, ], cen_hist[2,1, ]), probs = q_val)
+quantile(c(simulated_data21[2, ], cen_hist[2,1, ]), probs = q_val)
 
 
-ggplot() + 
-  geom_density(aes(x = value, fill = "Historical"), colour = "black", alpha=0.5, data = as_tibble(simulated_data[ 2, ])) +
-  geom_density(aes(x = value, fill = "Conditional"), colour = "black", alpha=0.5, data = as_tibble(simulated_data.cond[ 2, ])) +
-  theme_bw() +
-  theme(legend.position = "bottom") + 
-  labs(fill = NULL)
 
-q = c(0.99, 0.995, 0.996)
-q = sort(c(1-q, q))
 
-quantile(simulated_data[2,], prob = q)
-quantile(simulated_data.cond[2,], prob = q)
+
+
